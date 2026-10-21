@@ -11,7 +11,16 @@ import random
 import signal
 import subprocess
 import time
-import tkinter as tk
+
+try:
+    import tkinter as tk
+except ImportError:
+    import sys
+    sys.exit(
+        "Ce jeu a besoin de tkinter (absent sur cette machine).\n"
+        "Installe-le puis relance :\n"
+        "    sudo apt install python3-tk"
+    )
 
 MOT_SECRET = "laissemoisortir"
 DOT_R = 7
@@ -21,13 +30,21 @@ SENS = 3.0
 # fige alors que la souris bouge encore.
 MARGE_RECENTRE = 220
 
+# (schema, clé, valeur_désactivée) — la valeur d'origine est sauvegardée puis
+# remise en sortie. overlay-key est une chaîne (touche Super seule → vue
+# d'ensemble), les autres sont des listes de raccourcis.
 RACCOURCIS = [
-    ("org.gnome.desktop.wm.keybindings", k) for k in (
-        "switch-applications", "switch-applications-backward",
-        "switch-windows", "switch-windows-backward",
-        "switch-group", "switch-group-backward",
-        "switch-panels", "switch-panels-backward",
-    )
+    ("org.gnome.desktop.wm.keybindings", "switch-applications", "[]"),
+    ("org.gnome.desktop.wm.keybindings", "switch-applications-backward", "[]"),
+    ("org.gnome.desktop.wm.keybindings", "switch-windows", "[]"),
+    ("org.gnome.desktop.wm.keybindings", "switch-windows-backward", "[]"),
+    ("org.gnome.desktop.wm.keybindings", "switch-group", "[]"),
+    ("org.gnome.desktop.wm.keybindings", "switch-group-backward", "[]"),
+    ("org.gnome.desktop.wm.keybindings", "switch-panels", "[]"),
+    ("org.gnome.desktop.wm.keybindings", "switch-panels-backward", "[]"),
+    ("org.gnome.mutter", "overlay-key", "''"),
+    ("org.gnome.shell.keybindings", "toggle-overview", "[]"),
+    ("org.gnome.shell.keybindings", "toggle-application-view", "[]"),
 ]
 SAUVEGARDE = os.path.expanduser("~/.cache/labyrinthe-raccourcis.json")
 RING = [(math.cos(math.radians(a)), math.sin(math.radians(a))) for a in range(0, 360, 45)]
@@ -82,13 +99,16 @@ def couper_raccourcis():
     # on répare avant de resauvegarder, sinon on archiverait des listes vides.
     restaurer_raccourcis()
     sauv = {}
-    for schema, key in RACCOURCIS:
-        sauv[f"{schema} {key}"] = _gsettings("get", schema, key) or "@as []"
+    for schema, key, _dis in RACCOURCIS:
+        cur = _gsettings("get", schema, key)
+        if cur:  # clé absente sur ce système → on l'ignore
+            sauv[f"{schema} {key}"] = cur
     os.makedirs(os.path.dirname(SAUVEGARDE), exist_ok=True)
     with open(SAUVEGARDE, "w") as f:
         json.dump(sauv, f)
-    for schema, key in RACCOURCIS:
-        _gsettings("set", schema, key, "[]")
+    for schema, key, dis in RACCOURCIS:
+        if f"{schema} {key}" in sauv:
+            _gsettings("set", schema, key, dis)
 
 
 def melange(c1, c2, t):
@@ -108,8 +128,36 @@ def serpentine(lanes, width, connector_width=None):
     return steps
 
 
-NIVEAUX = [serpentine(4, 70), serpentine(6, 46, 34), serpentine(8, 30, 22)]
-MARGES = [100, 140, 170]
+def dessin_niveau3():
+    """Points (en fractions de l'écran) du tracé dessiné à la main : un grand U,
+    une fente verticale, puis deux zones en vagues de plus en plus serrées."""
+    P = [(0.06, 0.20), (0.06, 0.82), (0.13, 0.82), (0.13, 0.18),
+         (0.20, 0.18), (0.20, 0.84)]
+    for i in range(41):                       # vagues modérées
+        f = i / 40
+        P.append((0.25 + 0.24 * f, 0.50 + 0.30 * math.sin(f * math.pi * 3)))
+    for i in range(61):                       # vagues plus serrées, plus amples
+        f = i / 60
+        P.append((0.52 + 0.42 * f, 0.50 + 0.34 * math.sin(f * math.pi * 5 + 0.6)))
+    return P
+
+
+def _dist_seg(px, py, ax, ay, dx, dy, L):
+    """Distance d'un point au segment (ax,ay)->(ax+dx,ay+dy), L = dx²+dy²."""
+    if L == 0:
+        return math.hypot(px - ax, py - ay)
+    t = (px - ax) * dx + (py - ay) * dy
+    t = 0.0 if t < 0 else (L if t > L else t)
+    t /= L
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+NIVEAUX = [
+    {"type": "serp", "spec": serpentine(4, 70), "marge": 100, "largeur": 70},
+    {"type": "serp", "spec": serpentine(6, 46, 34), "marge": 140, "largeur": 46},
+    {"type": "path", "points": dessin_niveau3(), "width": 44, "marge": 120,
+     "taunt": "BONNE CHANCE"},
+]
 
 
 class Jeu(tk.Tk):
@@ -192,6 +240,30 @@ class Jeu(tk.Tk):
         for a, b, c, d in safe:
             self.canvas.create_rectangle(a, b, c, d, fill=CORRIDOR, outline=CORRIDOR)
 
+    @staticmethod
+    def _build_path(w, h, pts_frac, width, margin):
+        pts = [(margin + fx * (w - 2 * margin), margin + fy * (h - 2 * margin))
+               for fx, fy in pts_frac]
+        half = width / 2
+        segs = []
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            dx, dy = bx - ax, by - ay
+            segs.append((ax, ay, dx, dy, dx * dx + dy * dy,
+                         min(ax, bx) - half, min(ay, by) - half,
+                         max(ax, bx) + half, max(ay, by) + half))
+        sx, sy = pts[0]
+        gx, gy = pts[-1]
+        box = lambda x, y: (int(x - half), int(y - half), int(x + half), int(y + half))
+        return pts, segs, box(sx, sy), box(gx, gy), half
+
+    def _peindre_chemin(self, pts, width):
+        flat = [c for p in pts for c in p]
+        for grow, col in HALO:
+            self.canvas.create_line(*flat, width=width + 2 * grow, fill=col,
+                                    capstyle="round", joinstyle="round")
+        self.canvas.create_line(*flat, width=width, fill=CORRIDOR,
+                                capstyle="round", joinstyle="round")
+
     def _pastille(self, box, couleur, label):
         for grow, t in ((11, 0.12), (7, 0.26), (4, 0.5)):
             col = melange(CORRIDOR, couleur, t)
@@ -210,9 +282,9 @@ class Jeu(tk.Tk):
         self._fond(w, h)
         self.canvas.create_text(w / 2, h / 2 - 18, text=f"NIVEAU {niveau + 1}",
                                 font=TITRE, fill=NEON)
-        largeur = NIVEAUX[niveau][0][2]
-        self.canvas.create_text(w / 2, h / 2 + 34,
-                                text=f"couloir de {largeur} px", font=SOUS, fill=ENCRE)
+        lvl = NIVEAUX[niveau]
+        sous = "couloir en lacets" if lvl["type"] == "path" else f"couloir de {lvl['largeur']} px"
+        self.canvas.create_text(w / 2, h / 2 + 34, text=sous, font=SOUS, fill=ENCRE)
         self.after(700, lambda: self.laby_start(niveau) if t == self.token else None)
 
     def _secouer(self, t, i=0):
@@ -264,10 +336,32 @@ class Jeu(tk.Tk):
             return self.fin()
 
         self._fond(w, h)
-        safe, start_box, goal_box = self._build_track(w, h, NIVEAUX[niveau], MARGES[niveau])
-        self._peindre_piste(safe)
+        lvl = NIVEAUX[niveau]
+        _in = lambda box, x, y: box[0] <= x <= box[2] and box[1] <= y <= box[3]
+        if lvl["type"] == "path":
+            pts, segs, start_box, goal_box, half = self._build_path(
+                w, h, lvl["points"], lvl["width"], lvl["marge"])
+            self._peindre_chemin(pts, lvl["width"])
+
+            def on_track(px, py):
+                if _in(start_box, px, py) or _in(goal_box, px, py):
+                    return True
+                for ax, ay, dx, dy, L, x0, y0, x1, y1 in segs:
+                    if (x0 <= px <= x1 and y0 <= py <= y1
+                            and _dist_seg(px, py, ax, ay, dx, dy, L) <= half):
+                        return True
+                return False
+        else:
+            safe, start_box, goal_box = self._build_track(
+                w, h, lvl["spec"], lvl["marge"])
+            self._peindre_piste(safe)
+            on_track = lambda px, py: (_in(start_box, px, py) or _in(goal_box, px, py)
+                                       or any(_in(r, px, py) for r in safe))
         self._pastille(start_box, DEPART, "DÉPART")
         self._pastille(goal_box, ARRIVEE, "ARRIVÉE")
+        if lvl.get("taunt"):
+            self.canvas.create_text(w * 0.5, h * 0.09, text=lvl["taunt"],
+                                    font=TITRE, fill=ARRIVEE)
 
         self.canvas.create_text(28, 26, text=f"NIVEAU {niveau + 1}/{len(NIVEAUX)}",
                                 font=HUD, fill=NEON, anchor="w")
@@ -314,10 +408,6 @@ class Jeu(tk.Tk):
             self.after(250, tic)
 
         tic()
-
-        _in = lambda box, x, y: box[0] <= x <= box[2] and box[1] <= y <= box[3]
-        on_track = lambda px, py: (_in(start_box, px, py) or _in(goal_box, px, py)
-                                   or any(_in(r, px, py) for r in safe))
 
         def check_point(px, py):
             if _in(goal_box, px, py):
